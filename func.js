@@ -34,7 +34,7 @@ const DEVICE = {
 const ORIGIN = {
   name: 'ruckus_wips_nodered',
   get sw_version() {
-    return typeof env !== 'undefined' ? (env.get('RUCKUS_SW_VERSION') || '1.1.0') : '1.1.0';
+    return typeof env !== 'undefined' ? (env.get('RUCKUS_SW_VERSION') || '1.2.0') : '1.2.0';
   },
   get support_url() {
     return typeof env !== 'undefined' ? (env.get('RUCKUS_SUPPORT_URL') || 'https://github.com/raphael1688dev/RUCKUS-NR') : 'https://github.com/raphael1688dev/RUCKUS-NR';
