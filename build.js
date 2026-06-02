@@ -48,6 +48,13 @@ for (const file of files) {
 fs.writeFileSync(path.join(__dirname, 'func.js'), bundled, 'utf8');
 console.log('✔ Successfully bundled into func.js');
 
+// Verification: Ensure no ES6 module syntax (import/export) leaks into the bundled output
+const cleanCode = bundled.replace(/\/\*[\s\S]*?\*\/|\/\/.*/g, ''); // strip comments
+if (/\bimport\b/.test(cleanCode) || /\bexport\b/.test(cleanCode)) {
+  console.error('Error: Bundled code contains ES6 module syntax (import/export)!');
+  process.exit(1);
+}
+
 // Update ruckus_wips.json flow file
 const flowPath = path.join(__dirname, 'flows/ruckus_wips.json');
 if (fs.existsSync(flowPath)) {
@@ -62,6 +69,13 @@ if (fs.existsSync(flowPath)) {
       // Clear node-level env variables to avoid shadowing OS environment variables
       if (node.env) {
         delete node.env;
+      }
+
+      // Ensure zlib is added to external libraries configuration
+      node.libs = node.libs || [];
+      const hasZlib = node.libs.some(lib => lib.module === 'zlib');
+      if (!hasZlib) {
+        node.libs.push({ var: 'zlib', module: 'zlib' });
       }
       
       updatedFn = true;

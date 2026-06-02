@@ -1,4 +1,4 @@
-import { ENABLE_UNBLOCK, MQTT_BASE_TOPIC } from './config.mjs';
+import { CONFIG } from './config.mjs';
 import { markMalicious, unmarkMalicious } from './api.mjs';
 import { performPoll } from './poll.mjs';
 
@@ -6,12 +6,12 @@ import { performPoll } from './poll.mjs';
 const topic = (msg && msg.topic) || '';
 
 // 1. Unified Command Processor (WIPS Only)
-if (topic.startsWith('ruckus_wips/cmd/') || topic.startsWith('ruckus/cmd/') || topic.startsWith(`${MQTT_BASE_TOPIC}/cmd/`)) {
+if (topic.startsWith('ruckus_wips/cmd/') || topic.startsWith('ruckus/cmd/') || topic.startsWith(`${CONFIG.MQTT_BASE_TOPIC}/cmd/`)) {
   let action = '';
   let commandPath = '';
   
-  if (topic.startsWith(`${MQTT_BASE_TOPIC}/cmd/`)) {
-    commandPath = `${MQTT_BASE_TOPIC}/cmd/`;
+  if (topic.startsWith(`${CONFIG.MQTT_BASE_TOPIC}/cmd/`)) {
+    commandPath = `${CONFIG.MQTT_BASE_TOPIC}/cmd/`;
     action = topic.substring(commandPath.length);
   } else if (topic.startsWith('ruckus_wips/cmd/')) {
     commandPath = 'ruckus_wips/cmd/';
@@ -36,7 +36,7 @@ if (topic.startsWith('ruckus_wips/cmd/') || topic.startsWith('ruckus/cmd/') || t
         await markMalicious(bssid);
       } 
       else if (action === 'unmark_malicious') {
-        if (!ENABLE_UNBLOCK) throw new Error('unmark disabled (set RUCKUS_ENABLE_UNBLOCK=true)');
+        if (!CONFIG.ENABLE_UNBLOCK) throw new Error('unmark disabled (set RUCKUS_ENABLE_UNBLOCK=true)');
         const bssid = String(payloadRaw).trim().toLowerCase().replace(/-/g, ':');
         if (!/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/.test(bssid)) throw new Error('invalid BSSID');
         await unmarkMalicious(bssid);
@@ -77,8 +77,14 @@ else if (msg.status && (msg.status.text === 'node-red:common.status.connected' |
 else {
   try {
     await performPoll();
+    context.set('pollErrorLogged', false);
   } catch (err) {
-    node.status({ fill: 'red', shape: 'ring', text: 'WIPS poll failed: ' + (err.message || err).toString().slice(0, 60) });
-    node.error('WIPS Poll failed: ' + (err.stack || err.message || err), msg);
+    const alreadyLogged = context.get('pollErrorLogged') || false;
+    if (!alreadyLogged) {
+      node.error('WIPS Poll failed: ' + (err.stack || err.message || err), msg);
+      context.set('pollErrorLogged', true);
+    } else {
+      node.warn('WIPS Poll continues to fail: ' + (err.message || err));
+    }
   }
 }

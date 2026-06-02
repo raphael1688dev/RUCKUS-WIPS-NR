@@ -1,5 +1,7 @@
 import tls from 'tls';
+import zlib from 'zlib';
 import { parseUrl, encodeParams, dechunkBuf } from './utils.mjs';
+import { CONFIG } from './config.mjs';
 
 export function cookieHeaderStr() {
   const jar = context.get('cookieJar') || {};
@@ -45,10 +47,32 @@ export function rawReq(method, url, data, opts) {
     reqText += CRLF + body;
     const chunks = [];
     let done = false;
-    const socket = tls.connect({ host: parsed.hostname, port: parsed.port, servername: parsed.hostname, rejectUnauthorized: false }, () => {
+
+    const tlsOpts = {
+      host: parsed.hostname,
+      port: parsed.port,
+      servername: parsed.hostname,
+      rejectUnauthorized: !!CONFIG.CA_CERT
+    };
+    if (CONFIG.CA_CERT) {
+      tlsOpts.ca = [CONFIG.CA_CERT];
+    }
+
+    const connTimer = setTimeout(() => {
+      if (!done) {
+        done = true;
+        try { socket.destroy(); } catch (e) {}
+        reject(new Error('Connect timeout: failed to connect to ' + parsed.hostname + ' within 15s'));
+      }
+    }, 15000);
+
+    const socket = tls.connect(tlsOpts, () => {
+      clearTimeout(connTimer);
       socket.write(reqText);
     });
+
     const finish = () => {
+      clearTimeout(connTimer);
       if (done) return; done = true;
       try { socket.destroy(); } catch (e) {}
       const buf = Buffer.concat(chunks);
@@ -78,16 +102,63 @@ export function rawReq(method, url, data, opts) {
       if ((resHeaders['transfer-encoding'] || '').toLowerCase().indexOf('chunked') !== -1) {
         bodyBuf = dechunkBuf(bodyBuf);
       }
+      if ((resHeaders['content-encoding'] || '').toLowerCase().indexOf('gzip') !== -1) {
+        try {
+          bodyBuf = zlib.gunzipSync(bodyBuf);
+        } catch (err) {
+          reject(new Error('Failed to decompress gzip content: ' + err.message));
+          return;
+        }
+      } else if ((resHeaders['content-encoding'] || '').toLowerCase().indexOf('deflate') !== -1) {
+        try {
+          bodyBuf = zlib.inflateSync(bodyBuf);
+        } catch (err) {
+          reject(new Error('Failed to decompress deflate content: ' + err.message));
+          return;
+        }
+      }
       saveCookies(resHeaders);
       resolve({ status: status, headers: resHeaders, data: bodyBuf.toString('utf8') });
     };
-    socket.on('data', (c) => chunks.push(c));
+
+    let headersParsed = false;
+    let contentLength = -1;
+    let headerLength = -1;
+
+    socket.on('data', (c) => {
+      chunks.push(c);
+      if (!headersParsed) {
+        const buf = Buffer.concat(chunks);
+        const sep4 = String.fromCharCode(13, 10, 13, 10);
+        const sep2 = String.fromCharCode(10, 10);
+        let idx = buf.indexOf(sep4); let skip = 4;
+        if (idx === -1) { idx = buf.indexOf(sep2); skip = 2; }
+        if (idx !== -1) {
+          headersParsed = true;
+          headerLength = idx + skip;
+          const headText = buf.slice(0, idx).toString('latin1');
+          const m = headText.match(/content-length:\s*(\d+)/i);
+          if (m) {
+            contentLength = parseInt(m[1], 10);
+          }
+        }
+      }
+      if (headersParsed && contentLength >= 0) {
+        const totalBytes = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
+        const bodyBytesReceived = totalBytes - headerLength;
+        if (bodyBytesReceived >= contentLength) {
+          finish();
+        }
+      }
+    });
+
     socket.on('end', finish);
     socket.on('close', finish);
-    socket.on('error', (e) => { if (!done) { done = true; reject(e); } });
+    socket.on('error', (e) => { clearTimeout(connTimer); if (!done) { done = true; reject(e); } });
     socket.setTimeout(15000, () => { if (!done) { try { socket.destroy(); } catch (e) {} finish(); } });
   });
 }
+
 
 export async function httpHead(url, opts) { return rawReq('head', url, undefined, opts); }
 export async function httpGet(url, opts) { return rawReq('get', url, undefined, opts); }

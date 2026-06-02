@@ -1,7 +1,7 @@
-import { DEVICE, ORIGIN, MQTT_BASE_TOPIC } from './config.mjs';
+import { DEVICE, ORIGIN, CONFIG } from './config.mjs';
 
 export function discoveryMessages() {
-  const avail = { availability_topic: `${MQTT_BASE_TOPIC}/status`, payload_available: 'online', payload_not_available: 'offline' };
+  const avail = { availability_topic: `${CONFIG.MQTT_BASE_TOPIC}/status`, payload_available: 'online', payload_not_available: 'offline' };
   
   const makeSensor = (suffix, name, icon, stateTopic, countTemplate, attrTemplate) => ({
     topic: `homeassistant/sensor/ruckus_wips_${suffix}/config`,
@@ -23,7 +23,7 @@ export function discoveryMessages() {
   });
 
   const sensorConfig = (suffix, name, icon) => makeSensor(
-    suffix, name, icon, `${MQTT_BASE_TOPIC}/state/${suffix}`, 
+    suffix, name, icon, `${CONFIG.MQTT_BASE_TOPIC}/state/${suffix}`, 
     '{{ value_json.count }}', 
     '{{ {"rogues": value_json.rogues, "last_updated": value_json.last_updated} | tojson }}'
   );
@@ -33,7 +33,7 @@ export function discoveryMessages() {
     payload: JSON.stringify({
       name: 'New rogue detected',
       unique_id: 'ruckus_wips_new_rogue',
-      state_topic: `${MQTT_BASE_TOPIC}/event/new_rogue`,
+      state_topic: `${CONFIG.MQTT_BASE_TOPIC}/event/new_rogue`,
       event_types: ['new_rogue'],
       device: DEVICE,
       origin: ORIGIN,

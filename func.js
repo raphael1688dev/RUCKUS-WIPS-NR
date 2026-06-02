@@ -5,31 +5,40 @@
 // ============================================================================
 
 // --- config.mjs ---
-const HOST = typeof env !== 'undefined' ? (env.get('RUCKUS_HOST') || 'ruckus.raphaelchen.org') : 'ruckus.raphaelchen.org';
-const USER = typeof env !== 'undefined' ? (env.get('RUCKUS_USER') || 'admin') : 'admin';
-const PASS = typeof env !== 'undefined' ? (env.get('RUCKUS_PASS') || 'CHANGE_ME') : 'CHANGE_ME';
-const ENABLE_UNBLOCK = typeof env !== 'undefined' ? ((env.get('RUCKUS_ENABLE_UNBLOCK') || 'true') === 'true') : true;
-
-// Additional environment variables requested by Section 3.2:
-const MQTT_BASE_TOPIC = typeof env !== 'undefined' ? (env.get('RUCKUS_MQTT_BASE_TOPIC') || 'ruckus_wips') : 'ruckus_wips';
-const DEVICE_IDENTIFIER = typeof env !== 'undefined' ? (env.get('RUCKUS_DEVICE_IDENTIFIER') || 'ruckus_wips_main') : 'ruckus_wips_main';
-const DEVICE_NAME = typeof env !== 'undefined' ? (env.get('RUCKUS_DEVICE_NAME') || 'RUCKUS Unleashed WIPS') : 'RUCKUS Unleashed WIPS';
-const DEVICE_MODEL = typeof env !== 'undefined' ? (env.get('RUCKUS_DEVICE_MODEL') || 'Unleashed WIPS (via Node-RED)') : 'Unleashed WIPS (via Node-RED)';
-const SW_VERSION = typeof env !== 'undefined' ? (env.get('RUCKUS_SW_VERSION') || '1.1.0') : '1.1.0';
-const SUPPORT_URL = typeof env !== 'undefined' ? (env.get('RUCKUS_SUPPORT_URL') || 'https://github.com/raphael1688dev/RUCKUS-NR') : 'https://github.com/raphael1688dev/RUCKUS-NR';
+const CONFIG = {
+  get HOST() { return typeof env !== 'undefined' ? (env.get('RUCKUS_HOST') || 'ruckus.raphaelchen.org') : 'ruckus.raphaelchen.org'; },
+  get USER() { return typeof env !== 'undefined' ? (env.get('RUCKUS_USER') || 'admin') : 'admin'; },
+  get PASS() { return typeof env !== 'undefined' ? (env.get('RUCKUS_PASS') || 'CHANGE_ME') : 'CHANGE_ME'; },
+  get ENABLE_UNBLOCK() { return typeof env !== 'undefined' ? ((env.get('RUCKUS_ENABLE_UNBLOCK') || 'true') === 'true') : true; },
+  get CA_CERT() { return typeof env !== 'undefined' ? (env.get('RUCKUS_CA_CERT') || '') : ''; },
+  get MQTT_BASE_TOPIC() { return typeof env !== 'undefined' ? (env.get('RUCKUS_MQTT_BASE_TOPIC') || 'ruckus_wips') : 'ruckus_wips'; }
+};
 
 const DEVICE = {
-  identifiers: [DEVICE_IDENTIFIER],
-  name: DEVICE_NAME,
+  get identifiers() {
+    const id = typeof env !== 'undefined' ? (env.get('RUCKUS_DEVICE_IDENTIFIER') || 'ruckus_wips_main') : 'ruckus_wips_main';
+    return [id];
+  },
+  get name() {
+    return typeof env !== 'undefined' ? (env.get('RUCKUS_DEVICE_NAME') || 'RUCKUS Unleashed WIPS') : 'RUCKUS Unleashed WIPS';
+  },
   manufacturer: 'Ruckus Networks',
-  model: DEVICE_MODEL,
-  configuration_url: `https://${HOST}/`,
+  get model() {
+    return typeof env !== 'undefined' ? (env.get('RUCKUS_DEVICE_MODEL') || 'Unleashed WIPS (via Node-RED)') : 'Unleashed WIPS (via Node-RED)';
+  },
+  get configuration_url() {
+    return `https://${CONFIG.HOST}/`;
+  }
 };
 
 const ORIGIN = {
   name: 'ruckus_wips_nodered',
-  sw_version: SW_VERSION,
-  support_url: SUPPORT_URL,
+  get sw_version() {
+    return typeof env !== 'undefined' ? (env.get('RUCKUS_SW_VERSION') || '1.1.0') : '1.1.0';
+  },
+  get support_url() {
+    return typeof env !== 'undefined' ? (env.get('RUCKUS_SUPPORT_URL') || 'https://github.com/raphael1688dev/RUCKUS-NR') : 'https://github.com/raphael1688dev/RUCKUS-NR';
+  }
 };
 
 
@@ -184,10 +193,32 @@ function rawReq(method, url, data, opts) {
     reqText += CRLF + body;
     const chunks = [];
     let done = false;
-    const socket = tls.connect({ host: parsed.hostname, port: parsed.port, servername: parsed.hostname, rejectUnauthorized: false }, () => {
+
+    const tlsOpts = {
+      host: parsed.hostname,
+      port: parsed.port,
+      servername: parsed.hostname,
+      rejectUnauthorized: !!CONFIG.CA_CERT
+    };
+    if (CONFIG.CA_CERT) {
+      tlsOpts.ca = [CONFIG.CA_CERT];
+    }
+
+    const connTimer = setTimeout(() => {
+      if (!done) {
+        done = true;
+        try { socket.destroy(); } catch (e) {}
+        reject(new Error('Connect timeout: failed to connect to ' + parsed.hostname + ' within 15s'));
+      }
+    }, 15000);
+
+    const socket = tls.connect(tlsOpts, () => {
+      clearTimeout(connTimer);
       socket.write(reqText);
     });
+
     const finish = () => {
+      clearTimeout(connTimer);
       if (done) return; done = true;
       try { socket.destroy(); } catch (e) {}
       const buf = Buffer.concat(chunks);
@@ -217,16 +248,63 @@ function rawReq(method, url, data, opts) {
       if ((resHeaders['transfer-encoding'] || '').toLowerCase().indexOf('chunked') !== -1) {
         bodyBuf = dechunkBuf(bodyBuf);
       }
+      if ((resHeaders['content-encoding'] || '').toLowerCase().indexOf('gzip') !== -1) {
+        try {
+          bodyBuf = zlib.gunzipSync(bodyBuf);
+        } catch (err) {
+          reject(new Error('Failed to decompress gzip content: ' + err.message));
+          return;
+        }
+      } else if ((resHeaders['content-encoding'] || '').toLowerCase().indexOf('deflate') !== -1) {
+        try {
+          bodyBuf = zlib.inflateSync(bodyBuf);
+        } catch (err) {
+          reject(new Error('Failed to decompress deflate content: ' + err.message));
+          return;
+        }
+      }
       saveCookies(resHeaders);
       resolve({ status: status, headers: resHeaders, data: bodyBuf.toString('utf8') });
     };
-    socket.on('data', (c) => chunks.push(c));
+
+    let headersParsed = false;
+    let contentLength = -1;
+    let headerLength = -1;
+
+    socket.on('data', (c) => {
+      chunks.push(c);
+      if (!headersParsed) {
+        const buf = Buffer.concat(chunks);
+        const sep4 = String.fromCharCode(13, 10, 13, 10);
+        const sep2 = String.fromCharCode(10, 10);
+        let idx = buf.indexOf(sep4); let skip = 4;
+        if (idx === -1) { idx = buf.indexOf(sep2); skip = 2; }
+        if (idx !== -1) {
+          headersParsed = true;
+          headerLength = idx + skip;
+          const headText = buf.slice(0, idx).toString('latin1');
+          const m = headText.match(/content-length:\s*(\d+)/i);
+          if (m) {
+            contentLength = parseInt(m[1], 10);
+          }
+        }
+      }
+      if (headersParsed && contentLength >= 0) {
+        const totalBytes = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
+        const bodyBytesReceived = totalBytes - headerLength;
+        if (bodyBytesReceived >= contentLength) {
+          finish();
+        }
+      }
+    });
+
     socket.on('end', finish);
     socket.on('close', finish);
-    socket.on('error', (e) => { if (!done) { done = true; reject(e); } });
+    socket.on('error', (e) => { clearTimeout(connTimer); if (!done) { done = true; reject(e); } });
     socket.setTimeout(15000, () => { if (!done) { try { socket.destroy(); } catch (e) {} finish(); } });
   });
 }
+
 
 async function httpHead(url, opts) { return rawReq('head', url, undefined, opts); }
 async function httpGet(url, opts) { return rawReq('get', url, undefined, opts); }
@@ -236,17 +314,17 @@ async function httpPost(url, data, opts) { return rawReq('post', url, data, opts
 // --- api.mjs ---
 
 async function discoverLoginUrl() {
-  const r = await httpHead(`https://${HOST}/`);
+  const r = await httpHead(`https://${CONFIG.HOST}/`);
   let loc = r.headers?.location;
-  if (!loc) throw new Error('Discover: no Location header from https://' + HOST + '/');
+  if (!loc) throw new Error('Discover: no Location header from https://' + CONFIG.HOST + '/');
   if (!loc.startsWith('http')) {
-    loc = `https://${HOST}${loc.startsWith('/') ? '' : '/'}${loc}`;
+    loc = `https://${CONFIG.HOST}${loc.startsWith('/') ? '' : '/'}${loc}`;
   }
   const r2 = await httpHead(loc);
   if (r2.status === 302 && r2.headers?.location) {
     let loc2 = r2.headers.location;
     if (!loc2.startsWith('http')) {
-      loc = `https://${HOST}${loc2.startsWith('/') ? '' : '/'}${loc2}`;
+      loc = `https://${CONFIG.HOST}${loc2.startsWith('/') ? '' : '/'}${loc2}`;
     } else {
       loc = loc2;
     }
@@ -259,6 +337,22 @@ async function discoverLoginUrl() {
 }
 
 async function login() {
+  const lastUser = context.get('lastUser');
+  const lastPass = context.get('lastPass');
+  const lastHost = context.get('lastHost');
+  if (CONFIG.USER !== lastUser || CONFIG.PASS !== lastPass || CONFIG.HOST !== lastHost) {
+    context.set('lockoutTimestamp', 0);
+    context.set('lastUser', CONFIG.USER);
+    context.set('lastPass', CONFIG.PASS);
+    context.set('lastHost', CONFIG.HOST);
+  }
+
+  const lockout = context.get('lockoutTimestamp') || 0;
+  if (Date.now() < lockout) {
+    const minLeft = Math.ceil((lockout - Date.now()) / 60000);
+    throw new Error(`Login is locked out due to previous credential failure. Cooldown remaining: ${minLeft} minutes.`);
+  }
+
   let loginUrl = context.get('loginUrl');
   let baseUrl = context.get('baseUrl');
   if (!loginUrl) {
@@ -271,14 +365,15 @@ async function login() {
     return str[0] + '*'.repeat(str.length - 2) + str[str.length - 1];
   };
   if (typeof node !== 'undefined') {
-    node.warn(`[Ruckus Config Debug] HOST=${HOST}, USER=${USER}, PASS=${mask(PASS)} (length=${PASS.length})`);
+    node.warn(`[Ruckus Config Debug] HOST=${CONFIG.HOST}, USER=${CONFIG.USER}, PASS=${mask(CONFIG.PASS)} (length=${CONFIG.PASS.length})`);
   }
 
   const r = await httpHead(loginUrl, {
-    params: { username: USER, password: PASS, ok: 'Log In' },
+    params: { username: CONFIG.USER, password: CONFIG.PASS, ok: 'Log In' },
   });
   const loc = r.headers?.location || '';
   if (r.status === 200 || loc.indexOf('login.jsp') !== -1) {
+    context.set('lockoutTimestamp', Date.now() + 10 * 60 * 1000); // 10 minutes lockout
     throw new Error('LOGIN_INCORRECT');
   }
   let token = null;
@@ -386,7 +481,7 @@ async function unmarkMalicious(bssid) {
 // --- discovery.mjs ---
 
 function discoveryMessages() {
-  const avail = { availability_topic: `${MQTT_BASE_TOPIC}/status`, payload_available: 'online', payload_not_available: 'offline' };
+  const avail = { availability_topic: `${CONFIG.MQTT_BASE_TOPIC}/status`, payload_available: 'online', payload_not_available: 'offline' };
   
   const makeSensor = (suffix, name, icon, stateTopic, countTemplate, attrTemplate) => ({
     topic: `homeassistant/sensor/ruckus_wips_${suffix}/config`,
@@ -408,7 +503,7 @@ function discoveryMessages() {
   });
 
   const sensorConfig = (suffix, name, icon) => makeSensor(
-    suffix, name, icon, `${MQTT_BASE_TOPIC}/state/${suffix}`, 
+    suffix, name, icon, `${CONFIG.MQTT_BASE_TOPIC}/state/${suffix}`, 
     '{{ value_json.count }}', 
     '{{ {"rogues": value_json.rogues, "last_updated": value_json.last_updated} | tojson }}'
   );
@@ -418,7 +513,7 @@ function discoveryMessages() {
     payload: JSON.stringify({
       name: 'New rogue detected',
       unique_id: 'ruckus_wips_new_rogue',
-      state_topic: `${MQTT_BASE_TOPIC}/event/new_rogue`,
+      state_topic: `${CONFIG.MQTT_BASE_TOPIC}/event/new_rogue`,
       event_types: ['new_rogue'],
       device: DEVICE,
       origin: ORIGIN,
@@ -439,78 +534,124 @@ function discoveryMessages() {
 
 // --- poll.mjs ---
 
+let activePollPromise = null;
+
 async function performPoll() {
-  const ts = Date.now();
-
-  // WIPS Polling
-  const activeRaw = await getActiveRogues();
-  const blockedRaw = await getBlockedRogues();
-
-  const rogues = {};
-  for (const r of activeRaw) {
-    const n = normalizeRogue(r);
-    if (!n.bssid) continue;
-    rogues[n.bssid] = n;
+  if (activePollPromise) {
+    return activePollPromise;
   }
-  for (const r of blockedRaw) {
-    const n = normalizeRogue(r);
-    if (!n.bssid) continue;
-    if (!rogues[n.bssid]) rogues[n.bssid] = n;
-  }
-  const list = Object.values(rogues);
-  const activeUnblocked = list.filter(r => !r.blocked);
-  const blocked = list.filter(r => r.blocked);
 
-  // Diff to fire new-rogue events (strictly active unblocked ones)
-  let seen = context.get('seenBssids');
-  const newOnes = [];
-  if (!seen) {
-    seen = {};
-  }
-  
-  // Check for newly appeared active unblocked BSSIDs
-  for (const r of activeUnblocked) {
-    if (!seen[r.bssid]) {
-      newOnes.push(r);
+  activePollPromise = (async () => {
+    const ts = Date.now();
+
+    const lockout = context.get('lockoutTimestamp') || 0;
+    if (Date.now() < lockout) {
+      const minLeft = Math.ceil((lockout - Date.now()) / 60000);
+      node.status({ fill: 'yellow', shape: 'ring', text: `Login locked (cooldown: ${minLeft}m)` });
+      return;
     }
-  }
-  
-  // Re-create the seen list to consist strictly of currently active unblocked BSSIDs
-  seen = {};
-  for (const r of activeUnblocked) {
-    seen[r.bssid] = true;
-  }
-  context.set('seenBssids', seen);
 
-  // First-run: publish Discovery configs + online status
-  if (!context.get('discoveryPublished')) {
-    for (const m of discoveryMessages()) node.send([m, null]);
-    node.send([{ topic: `${MQTT_BASE_TOPIC}/status`, payload: 'online', retain: true, qos: 1 }, null]);
-    context.set('discoveryPublished', true);
+    try {
+      // WIPS Polling
+      const activeRaw = await getActiveRogues();
+      const blockedRaw = await getBlockedRogues();
+
+      const rogues = {};
+      for (const r of activeRaw) {
+        const n = normalizeRogue(r);
+        if (!n.bssid) continue;
+        rogues[n.bssid] = n;
+      }
+      for (const r of blockedRaw) {
+        const n = normalizeRogue(r);
+        if (!n.bssid) continue;
+        if (!rogues[n.bssid]) rogues[n.bssid] = n;
+      }
+      const list = Object.values(rogues);
+      const activeUnblocked = list.filter(r => !r.blocked);
+      const blocked = list.filter(r => r.blocked);
+
+      // Diff to fire new-rogue events (strictly active unblocked ones)
+      let seen = context.get('seenBssids');
+      const newOnes = [];
+      if (!seen) {
+        seen = {};
+      }
+      
+      // Check for newly appeared active unblocked BSSIDs
+      for (const r of activeUnblocked) {
+        if (!seen[r.bssid]) {
+          newOnes.push(r);
+        }
+      }
+      
+      // Re-create the seen list to consist strictly of currently active unblocked BSSIDs
+      seen = {};
+      for (const r of activeUnblocked) {
+        seen[r.bssid] = true;
+      }
+      context.set('seenBssids', seen);
+
+      // Reset failure count and publish online status if it changed
+      context.set('failCount', 0);
+      if (context.get('lastAvailability') !== 'online' || !context.get('discoveryPublished')) {
+        node.send([{ topic: `${CONFIG.MQTT_BASE_TOPIC}/status`, payload: 'online', retain: true, qos: 1 }, null]);
+        context.set('lastAvailability', 'online');
+      }
+
+      // First-run: publish Discovery configs
+      if (!context.get('discoveryPublished')) {
+        for (const m of discoveryMessages()) node.send([m, null]);
+        context.set('discoveryPublished', true);
+      }
+
+      // Publish WIPS state topics
+      const stateMsg = (suffix, count, rogues) => ({
+        topic: `${CONFIG.MQTT_BASE_TOPIC}/state/${suffix}`,
+        payload: JSON.stringify({ count, last_updated: ts, rogues }),
+        retain: true,
+        qos: 1,
+      });
+      node.send([stateMsg('active',  activeUnblocked.length, activeUnblocked), null]);
+      node.send([stateMsg('blocked', blocked.length,         blocked),         null]);
+      node.send([stateMsg('total',   list.length,            list),            null]);
+
+      // Fire new-rogue events
+      for (const r of newOnes) {
+        const payload = { event_type: 'new_rogue', ...r };
+        node.send([{ topic: `${CONFIG.MQTT_BASE_TOPIC}/event/new_rogue`, payload: JSON.stringify(payload), retain: false, qos: 1 }, null]);
+      }
+
+      node.status({
+        fill: 'green',
+        shape: 'dot',
+        text: `${activeUnblocked.length} active / ${blocked.length} blocked @ ${new Date(ts).toLocaleTimeString()}`
+      });
+    } catch (err) {
+      const failCount = (context.get('failCount') || 0) + 1;
+      context.set('failCount', failCount);
+      
+      node.status({
+        fill: 'red',
+        shape: 'ring',
+        text: `WIPS poll failed (${failCount}/3): ` + (err.message || err).toString().slice(0, 45)
+      });
+      
+      if (failCount >= 3) {
+        if (context.get('lastAvailability') !== 'offline') {
+          node.send([{ topic: `${CONFIG.MQTT_BASE_TOPIC}/status`, payload: 'offline', retain: true, qos: 1 }, null]);
+          context.set('lastAvailability', 'offline');
+        }
+      }
+      throw err;
+    }
+  })();
+
+  try {
+    await activePollPromise;
+  } finally {
+    activePollPromise = null;
   }
-
-  // Publish WIPS state topics
-  const stateMsg = (suffix, count, rogues) => ({
-    topic: `${MQTT_BASE_TOPIC}/state/${suffix}`,
-    payload: JSON.stringify({ count, last_updated: ts, rogues }),
-    retain: true,
-    qos: 1,
-  });
-  node.send([stateMsg('active',  activeUnblocked.length, activeUnblocked), null]);
-  node.send([stateMsg('blocked', blocked.length,         blocked),         null]);
-  node.send([stateMsg('total',   list.length,            list),            null]);
-
-  // Fire new-rogue events
-  for (const r of newOnes) {
-    const payload = { event_type: 'new_rogue', ...r };
-    node.send([{ topic: `${MQTT_BASE_TOPIC}/event/new_rogue`, payload: JSON.stringify(payload), retain: false, qos: 1 }, null]);
-  }
-
-  node.status({
-    fill: 'green',
-    shape: 'dot',
-    text: `${activeUnblocked.length} active / ${blocked.length} blocked @ ${new Date(ts).toLocaleTimeString()}`
-  });
 }
 
 
@@ -520,12 +661,12 @@ async function performPoll() {
 const topic = (msg && msg.topic) || '';
 
 // 1. Unified Command Processor (WIPS Only)
-if (topic.startsWith('ruckus_wips/cmd/') || topic.startsWith('ruckus/cmd/') || topic.startsWith(`${MQTT_BASE_TOPIC}/cmd/`)) {
+if (topic.startsWith('ruckus_wips/cmd/') || topic.startsWith('ruckus/cmd/') || topic.startsWith(`${CONFIG.MQTT_BASE_TOPIC}/cmd/`)) {
   let action = '';
   let commandPath = '';
   
-  if (topic.startsWith(`${MQTT_BASE_TOPIC}/cmd/`)) {
-    commandPath = `${MQTT_BASE_TOPIC}/cmd/`;
+  if (topic.startsWith(`${CONFIG.MQTT_BASE_TOPIC}/cmd/`)) {
+    commandPath = `${CONFIG.MQTT_BASE_TOPIC}/cmd/`;
     action = topic.substring(commandPath.length);
   } else if (topic.startsWith('ruckus_wips/cmd/')) {
     commandPath = 'ruckus_wips/cmd/';
@@ -550,7 +691,7 @@ if (topic.startsWith('ruckus_wips/cmd/') || topic.startsWith('ruckus/cmd/') || t
         await markMalicious(bssid);
       } 
       else if (action === 'unmark_malicious') {
-        if (!ENABLE_UNBLOCK) throw new Error('unmark disabled (set RUCKUS_ENABLE_UNBLOCK=true)');
+        if (!CONFIG.ENABLE_UNBLOCK) throw new Error('unmark disabled (set RUCKUS_ENABLE_UNBLOCK=true)');
         const bssid = String(payloadRaw).trim().toLowerCase().replace(/-/g, ':');
         if (!/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/.test(bssid)) throw new Error('invalid BSSID');
         await unmarkMalicious(bssid);
@@ -591,9 +732,15 @@ else if (msg.status && (msg.status.text === 'node-red:common.status.connected' |
 else {
   try {
     await performPoll();
+    context.set('pollErrorLogged', false);
   } catch (err) {
-    node.status({ fill: 'red', shape: 'ring', text: 'WIPS poll failed: ' + (err.message || err).toString().slice(0, 60) });
-    node.error('WIPS Poll failed: ' + (err.stack || err.message || err), msg);
+    const alreadyLogged = context.get('pollErrorLogged') || false;
+    if (!alreadyLogged) {
+      node.error('WIPS Poll failed: ' + (err.stack || err.message || err), msg);
+      context.set('pollErrorLogged', true);
+    } else {
+      node.warn('WIPS Poll continues to fail: ' + (err.message || err));
+    }
   }
 }
 

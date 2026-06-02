@@ -1,19 +1,19 @@
-import { HOST, USER, PASS, ENABLE_UNBLOCK } from './config.mjs';
+import { CONFIG } from './config.mjs';
 import { parseXml, collectElements, findDone } from './utils.mjs';
 import { httpHead, httpGet, httpPost } from './http.mjs';
 
 export async function discoverLoginUrl() {
-  const r = await httpHead(`https://${HOST}/`);
+  const r = await httpHead(`https://${CONFIG.HOST}/`);
   let loc = r.headers?.location;
-  if (!loc) throw new Error('Discover: no Location header from https://' + HOST + '/');
+  if (!loc) throw new Error('Discover: no Location header from https://' + CONFIG.HOST + '/');
   if (!loc.startsWith('http')) {
-    loc = `https://${HOST}${loc.startsWith('/') ? '' : '/'}${loc}`;
+    loc = `https://${CONFIG.HOST}${loc.startsWith('/') ? '' : '/'}${loc}`;
   }
   const r2 = await httpHead(loc);
   if (r2.status === 302 && r2.headers?.location) {
     let loc2 = r2.headers.location;
     if (!loc2.startsWith('http')) {
-      loc = `https://${HOST}${loc2.startsWith('/') ? '' : '/'}${loc2}`;
+      loc = `https://${CONFIG.HOST}${loc2.startsWith('/') ? '' : '/'}${loc2}`;
     } else {
       loc = loc2;
     }
@@ -26,6 +26,22 @@ export async function discoverLoginUrl() {
 }
 
 export async function login() {
+  const lastUser = context.get('lastUser');
+  const lastPass = context.get('lastPass');
+  const lastHost = context.get('lastHost');
+  if (CONFIG.USER !== lastUser || CONFIG.PASS !== lastPass || CONFIG.HOST !== lastHost) {
+    context.set('lockoutTimestamp', 0);
+    context.set('lastUser', CONFIG.USER);
+    context.set('lastPass', CONFIG.PASS);
+    context.set('lastHost', CONFIG.HOST);
+  }
+
+  const lockout = context.get('lockoutTimestamp') || 0;
+  if (Date.now() < lockout) {
+    const minLeft = Math.ceil((lockout - Date.now()) / 60000);
+    throw new Error(`Login is locked out due to previous credential failure. Cooldown remaining: ${minLeft} minutes.`);
+  }
+
   let loginUrl = context.get('loginUrl');
   let baseUrl = context.get('baseUrl');
   if (!loginUrl) {
@@ -38,14 +54,15 @@ export async function login() {
     return str[0] + '*'.repeat(str.length - 2) + str[str.length - 1];
   };
   if (typeof node !== 'undefined') {
-    node.warn(`[Ruckus Config Debug] HOST=${HOST}, USER=${USER}, PASS=${mask(PASS)} (length=${PASS.length})`);
+    node.warn(`[Ruckus Config Debug] HOST=${CONFIG.HOST}, USER=${CONFIG.USER}, PASS=${mask(CONFIG.PASS)} (length=${CONFIG.PASS.length})`);
   }
 
   const r = await httpHead(loginUrl, {
-    params: { username: USER, password: PASS, ok: 'Log In' },
+    params: { username: CONFIG.USER, password: CONFIG.PASS, ok: 'Log In' },
   });
   const loc = r.headers?.location || '';
   if (r.status === 200 || loc.indexOf('login.jsp') !== -1) {
+    context.set('lockoutTimestamp', Date.now() + 10 * 60 * 1000); // 10 minutes lockout
     throw new Error('LOGIN_INCORRECT');
   }
   let token = null;
