@@ -820,29 +820,21 @@ description: ""
 
 
 
-## Technical Debts & Refactoring Backlog
+## Technical Debts & Refactoring Backlog (Fully Resolved in v1.2.0)
 
-As the project has evolved into a full native JavaScript bridge, several technical debts have accumulated. Future developers should review and address these backlog items:
+All previously identified technical debts have been fully resolved in the `v1.2.0` release:
 
-### 1. Code Monolith (`func.js` Maintainability) — **High Priority**
-* **Debt**: All core logics (raw TLS networking, XML parsing, cookie jar, polling coordination, discovery payload construction, and command dispatching) are tightly coupled inside a single 880+ line JavaScript block (`func.js` / `fn_ruckus` node).
-* **Impact**: Precludes standard unit testing and is highly unergonomic to edit inside Node-RED's Function Node UI.
-* **Remediation**: Consider decomposing the flow into linked subflow nodes or implementing a bundling script (`build.py`) that generates the flow JSON from clean modular ES6 modules under a `src/` directory.
+### 1. Code Monolith (`func.js` Maintainability) — **Resolved**
+* **Resolution**: Decomposed the monolithic JavaScript block into 7 clean, testable ES Modules under the `src/` directory. Created a `build.js` bundling script that automatically strips ESM syntax, runs syntax validation, and injects the bundled code along with dependency declarations directly into `flows/ruckus_wips.json`.
 
-### 2. Lenient Hand-Rolled TLS HTTP/1.0 Parser — **Medium-High Priority**
-* **Debt**: `rawReq()` implements an lenient socket reader over raw TLS to bypass Node's `llhttp` parser crashes caused by Unleashed's malformed HTTP responses.
-* **Impact**: It assumes an EOF-framed (`Connection: close`) HTTP/1.0 sequence. If Ruckus updates its embedded web server to enforce HTTP/1.1 persistent connections (`Keep-Alive`) or alters header formatting rules (e.g., casing, multi-line headers), this custom parser might truncate data or stall. It does not support gzip compression.
-* **Remediation**: Establish defensive assertions in `rawReq()` status-line and header parsers to fail gracefully and warn immediately if compressed content-encoding is received.
+### 2. Lenient Hand-Rolled TLS HTTP/1.0 Parser — **Resolved**
+* **Resolution**: Added automatic `zlib` gzip/deflate decompression to the response body parser. Implemented early stream resolution based on parsing the `Content-Length` header to prevent socket hangs on persistent Keep-Alive connections. Added support for optional TLS validation via `RUCKUS_CA_CERT` to prevent local LAN MitM attacks. Added a strict 15-second connect handshake timeout to gracefully abort dead socket connections.
 
-### 3. Concurrent Auth Storms & Concurrency Lockouts — **Medium Priority**
-* **Debt**: When the session cookie expires, parallel promises triggered during a poll cycle will all detect a `302` redirect and execute `login()` concurrently.
-* **Impact**: Floods the AP controller with concurrent login queries, risking IP lockout or CPU spikes. Invalid credentials could cause continuous login attempts, locking the admin account permanently.
-* **Remediation**: Implement an asynchronous mutex lock or queue for `login()` so concurrent requests await the active login's resolution. Add a cool-down lockout window (e.g., 5 mins) after a `LOGIN_INCORRECT` event.
+### 3. Concurrent Auth Storms & Concurrency Lockouts — **Resolved**
+* **Resolution**: Implemented dynamic concurrency locking (`activePollPromise` returning the ongoing promise) to debounce duplicate polling requests. Added a 10-minute brute-force lockout window inside the Node-RED context upon authentication failures (`LOGIN_INCORRECT`), which automatically clears if credentials or target host configurations change.
 
-### 4. Soft Failures & State Reporting Integrity — **Low Priority**
-* **Debt**: If the Ruckus controller goes offline, the status topic (`ruckus_wips/status`) remains `online` indefinitely (only going offline on MQTT broker disconnect via LWT).
-* **Impact**: Home Assistant entities show stale metrics as active instead of becoming `unavailable`.
-* **Remediation**: Track consecutive poll failures in `context`. Actively publish `offline` to `ruckus_wips/status` if the poll fails 3 times consecutively, restoring `online` only when communication is restored.
+### 4. Soft Failures & State Reporting Integrity — **Resolved**
+* **Resolution**: Tracked consecutive polling failures in context. If 3 consecutive updates fail, Node-RED publishes `offline` to the MQTT status topic (`ruckus_wips/status`) to set Home Assistant entities as unavailable. Resets failure count and publishes `online` as soon as communication succeeds.
 
 ## MQTT Protocol Version Troubleshooting (2026-06-01)
 
