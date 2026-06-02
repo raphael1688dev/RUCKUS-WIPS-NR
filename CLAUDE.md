@@ -851,10 +851,22 @@ All previously identified technical debts have been fully resolved in the `v1.2.
 ### Command Execution Local Poll Loopback (2026-06-02)
 * **Symptom**: After clicking "Block" or triggering a command via MQTT on the Home Assistant dashboard, the state sensors (e.g. Active Unblocked list) did not update immediately and required waiting up to 30 seconds for the next scheduled background poll.
 * **Cause**: The command processor block was attempting to trigger a poll by doing `node.send({ topic: 'poll', ... })` to port 1, which only published the trigger to the downstream MQTT publish node instead of loopback triggering the local Function node.
-* **Resolution**: Refactored the WIPS poll logic into an asynchronous helper `performPoll()`, and invoked `await performPoll()` directly inside the command execution path immediately following a successful Ruckus API `markMalicious()` or `unmarkMalicious()` call. This forces an immediate, synchronous update of Home Assistant's state sensors.
+* **Resolution**: Refactored the WIPS poll logic into an asynchronous helper `performPoll()`, and invoked `await performPoll()` directly inside the command execution path immediately following a successful Ruckus API `markMalicious()` or `unmarkMalicious()` call. This forces an immediate, synchronous update of Home Assistant's state sensors.## Future Extensions & Feature Roadmap
 
+Future development iterations can expand the Ruckus AJAX driver to support full-blown wireless controller integration beyond WIPS:
 
+### 1. Wi-Fi Client Tracking & Room-Level Presence
+* **Objective**: Query active Wi-Fi clients (MAC, IP, Hostname, Connected AP, and RSSI signal strength) from Unleashed.
+* **Smart Home Use Case**: Precise room-level tracking in Home Assistant. Automate lights and HVAC by tracing which AP (e.g. Living Room vs. Bedroom) a client's device is currently connected to and its RSSI.
 
+### 2. Access Point Health & Telemetry
+* **Objective**: Monitor AP online status, uptime, CPU, memory usage, temperature, and client count.
+* **Smart Home Use Case**: Health dashboards and push notifications in Home Assistant (e.g. alerting the user if an AP drops offline or resource usage spikes).
 
+### 3. WLAN Controls & Automated Scheduler
+* **Objective**: Enable toggling SSIDs on/off and updating WPA keys dynamically via Ruckus AJAX cmdstat.
+* **Smart Home Use Case**: Automate kid's Wi-Fi access hours or configure a dynamic guest network (e.g. generating a dynamic QR code for guest access).
 
-
+### 4. Self-Defense WIPS Automations
+* **Objective**: Implement automatic blocking of "Evil Twin" rogues that spoof the home network SSID.
+* **Smart Home Use Case**: Secure the network immediately upon detecting duplicate BSSID spoofing.
