@@ -1,0 +1,564 @@
+=== Function Node: Ruckus AJAX driver ===
+--- initialize ---
+
+--- func ---
+// ============================================================================
+//  RUCKUS Unleashed AJAX WIPS driver — runs inside a Node-RED function node.
+//  Pure light-weight JavaScript implementation focusing strictly on WIPS.
+//
+//  Inbound message kinds:
+//    (a) poll trigger: msg.topic === 'poll'
+//        → fetch active/blocked rogue APs and publish to MQTT/HA
+//    (b) command:     msg.topic startsWith 'ruckus_wips/cmd/'
+//        → mark_malicious / unmark_malicious (Rogue AP blocking)
+// ============================================================================
+
+const HOST = env.get('RUCKUS_HOST') || 'ruckus.raphaelchen.org';
+const USER = env.get('RUCKUS_USER') || 'admin';
+const PASS = env.get('RUCKUS_PASS') || 'CHANGE_ME';
+const ENABLE_UNBLOCK = (env.get('RUCKUS_ENABLE_UNBLOCK') || 'true') === 'true';
+
+// --- raw TLS HTTP/1.0 request layer (no axios, no Node http parser) --------
+function parseUrl(raw) {
+  const sep = raw.indexOf('://');
+  const noScheme = sep === -1 ? raw : raw.slice(sep + 3);
+  const slash = noScheme.indexOf('/');
+  const authority = slash === -1 ? noScheme : noScheme.slice(0, slash);
+  const pathAndQuery = slash === -1 ? '/' : noScheme.slice(slash);
+  const colon = authority.indexOf(':');
+  const hostname = colon === -1 ? authority : authority.slice(0, colon);
+  const port = colon === -1 ? 443 : (parseInt(authority.slice(colon + 1), 10) || 443);
+  return { hostname: hostname, port: port, pathAndQuery: pathAndQuery };
+}
+function encodeParams(params) {
+  return Object.keys(params).map((k) => encodeURIComponent(k) + '=' + encodeURIComponent(String(params[k])).replace(/%20/g, '+')).join('&');
+}
+function dechunkBuf(buf) {
+  const CRLF = String.fromCharCode(13, 10);
+  const parts = [];
+  let i = 0;
+  while (i < buf.length) {
+    const lineEnd = buf.indexOf(CRLF, i);
+    if (lineEnd === -1) break;
+    let sizeStr = buf.slice(i, lineEnd).toString('latin1').trim();
+    const semi = sizeStr.indexOf(';');
+    if (semi !== -1) sizeStr = sizeStr.slice(0, semi);
+    const size = parseInt(sizeStr, 16);
+    if (isNaN(size) || size <= 0) break;
+    const dataStart = lineEnd + 2;
+    parts.push(buf.slice(dataStart, dataStart + size));
+    i = dataStart + size + 2;
+  }
+  return parts.length ? Buffer.concat(parts) : buf;
+}
+
+// --- manual cookie jar -------------
+function cookieHeaderStr() {
+  const jar = context.get('cookieJar') || {};
+  return Object.keys(jar).map((k) => `${k}=${jar[k]}`).join('; ');
+}
+function saveCookies(headers) {
+  const sc = headers && headers['set-cookie'];
+  if (!sc) return;
+  const jar = context.get('cookieJar') || {};
+  for (const line of sc) {
+    const pair = String(line).split(';')[0];
+    const i = pair.indexOf('=');
+    if (i > 0) jar[pair.slice(0, i).trim()] = pair.slice(i + 1).trim();
+  }
+  context.set('cookieJar', jar);
+}
+function rawReq(method, url, data, opts) {
+  opts = opts || {};
+  return new Promise((resolve, reject) => {
+    const parsed = parseUrl(url);
+    let path = parsed.pathAndQuery;
+    if (opts.params) {
+      const qs = encodeParams(opts.params);
+      if (qs) path += (path.indexOf('?') === -1 ? '?' : '&') + qs;
+    }
+    const headers = Object.assign({}, opts.headers);
+    const ck = cookieHeaderStr();
+    if (ck) headers.Cookie = ck;
+    headers.Host = parsed.hostname;
+    headers.Connection = 'close';
+    if (!headers['Accept-Encoding']) headers['Accept-Encoding'] = 'identity';
+    let body = '';
+    if (data !== undefined && data !== null && method !== 'head' && method !== 'get') {
+      body = typeof data === 'string' ? data : String(data);
+      headers['Content-Length'] = Buffer.byteLength(body);
+    }
+    const CRLF = String.fromCharCode(13, 10);
+    let reqText = method.toUpperCase() + ' ' + path + ' HTTP/1.0' + CRLF;
+    const hk = Object.keys(headers);
+    for (let i = 0; i < hk.length; i++) reqText += hk[i] + ': ' + headers[hk[i]] + CRLF;
+    reqText += CRLF + body;
+    const chunks = [];
+    let done = false;
+    const socket = tls.connect({ host: parsed.hostname, port: parsed.port, servername: parsed.hostname, rejectUnauthorized: false }, () => {
+      socket.write(reqText);
+    });
+    const finish = () => {
+      if (done) return; done = true;
+      try { socket.destroy(); } catch (e) {}
+      const buf = Buffer.concat(chunks);
+      const sep4 = String.fromCharCode(13, 10, 13, 10);
+      const sep2 = String.fromCharCode(10, 10);
+      let idx = buf.indexOf(sep4); let skip = 4;
+      if (idx === -1) { idx = buf.indexOf(sep2); skip = 2; }
+      const headText = (idx === -1 ? buf : buf.slice(0, idx)).toString('latin1');
+      let bodyBuf = idx === -1 ? Buffer.alloc(0) : buf.slice(idx + skip);
+      const lines = headText.split(String.fromCharCode(10));
+      const statusLine = (lines.shift() || '').trim();
+      const sp = statusLine.split(' ');
+      const status = parseInt(sp[1], 10) ?? 0;
+      const resHeaders = {};
+      const setCookie = [];
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const c = line.indexOf(':');
+        if (c === -1) continue;
+        const name = line.slice(0, c).trim().toLowerCase();
+        const val = line.slice(c + 1).trim();
+        if (name === 'set-cookie') setCookie.push(val);
+        else if (resHeaders[name] !== undefined) resHeaders[name] += ', ' + val;
+        else resHeaders[name] = val;
+      }
+      if (setCookie.length) resHeaders['set-cookie'] = setCookie;
+      if ((resHeaders['transfer-encoding'] || '').toLowerCase().indexOf('chunked') !== -1) {
+        bodyBuf = dechunkBuf(bodyBuf);
+      }
+      saveCookies(resHeaders);
+      resolve({ status: status, headers: resHeaders, data: bodyBuf.toString('utf8') });
+    };
+    socket.on('data', (c) => chunks.push(c));
+    socket.on('end', finish);
+    socket.on('close', finish);
+    socket.on('error', (e) => { if (!done) { done = true; reject(e); } });
+    socket.setTimeout(15000, () => { if (!done) { try { socket.destroy(); } catch (e) {} finish(); } });
+  });
+}
+async function httpHead(url, opts) { return rawReq('head', url, undefined, opts); }
+async function httpGet(url, opts) { return rawReq('get', url, undefined, opts); }
+async function httpPost(url, data, opts) { return rawReq('post', url, data, opts); }
+
+// --- XML helpers & WIPS parsers --------------------------------------------
+function parseXml(xml) {
+  return new Promise((resolve, reject) => {
+    new xml2js.Parser({ explicitArray: false, mergeAttrs: true })
+      .parseString(xml, (err, res) => err ? reject(err) : resolve(res));
+  });
+}
+
+function collectElements(node, tagName, acc) {
+  if (!node || typeof node !== 'object') return acc;
+  if (node[tagName] !== undefined) {
+    const r = node[tagName];
+    if (Array.isArray(r)) { for (const x of r) acc.push(x); } else { acc.push(r); }
+  }
+  const keys = Object.keys(node);
+  for (let i = 0; i < keys.length; i++) {
+    if (keys[i] === tagName) continue;
+    const v = node[keys[i]];
+    if (Array.isArray(v)) { for (const x of v) collectElements(x, tagName, acc); }
+    else if (v && typeof v === 'object') collectElements(v, tagName, acc);
+  }
+  return acc;
+}
+
+function findDone(node) {
+  if (!node || typeof node !== 'object') return undefined;
+  if (node.done !== undefined) return String(node.done);
+  const keys = Object.keys(node);
+  for (let i = 0; i < keys.length; i++) {
+    const v = node[keys[i]];
+    if (v && typeof v === 'object') { const d = findDone(v); if (d !== undefined) return d; }
+  }
+  return undefined;
+}
+
+function pickStrongestDetection(detection) {
+  if (!detection) return {};
+  if (Array.isArray(detection)) {
+    let best = detection[0] || {};
+    let bestRssi = parseInt(best.rssi || '0', 10);
+    for (const d of detection) {
+      const r = parseInt(d?.rssi || '0', 10);
+      if (r > bestRssi) { best = d; bestRssi = r; }
+    }
+    return best || {};
+  }
+  return detection;
+}
+
+function normalizeRogue(rec) {
+  const det = pickStrongestDetection(rec.detection);
+  return {
+    bssid: String(rec.mac || '').toLowerCase(),
+    ssid: rec.ssid || '',
+    channel: String(rec.channel || ''),
+    radio_band: rec['radio-band'] || '',
+    radio_type: rec['radio-type'] || rec['ieee80211-radio-type'] || '',
+    encryption: rec['is-open'] || '',
+    rogue_type: rec['rogue-type'] || '',
+    blocked: String(rec.blocked || '').toLowerCase() === 'true',
+    last_seen: parseInt(rec['last-seen'] || '0', 10),
+    detection_ap: det['sys-name'] || '',
+    detection_ap_location: det.location || '',
+    detection_ap_mac: String(det.ap || '').toLowerCase(),
+    rssi: parseInt(det.rssi || '0', 10),
+  };
+}
+
+// --- Ruckus WIPS API Endpoints ---------------------------------------------
+async function discoverLoginUrl() {
+  const r = await httpHead(`https://${HOST}/`);
+  let loc = r.headers?.location;
+  if (!loc) throw new Error('Discover: no Location header from https://' + HOST + '/');
+  if (!loc.startsWith('http')) {
+    loc = `https://${HOST}${loc.startsWith('/') ? '' : '/'}${loc}`;
+  }
+  const r2 = await httpHead(loc);
+  if (r2.status === 302 && r2.headers?.location) {
+    let loc2 = r2.headers.location;
+    if (!loc2.startsWith('http')) {
+      loc = `https://${HOST}${loc2.startsWith('/') ? '' : '/'}${loc2}`;
+    } else {
+      loc = loc2;
+    }
+  }
+  const baseUrl = loc.substring(0, loc.lastIndexOf('/'));
+  context.set('loginUrl', loc);
+  context.set('baseUrl', baseUrl);
+  context.set('cmdstatUrl', baseUrl + '/_cmdstat.jsp');
+  return { loginUrl: loc, baseUrl };
+}
+
+async function login() {
+  let loginUrl = context.get('loginUrl');
+  let baseUrl = context.get('baseUrl');
+  if (!loginUrl) {
+    ({ loginUrl, baseUrl } = await discoverLoginUrl());
+  }
+  const r = await httpHead(loginUrl, {
+    params: { username: USER, password: PASS, ok: 'Log In' },
+  });
+  const loc = r.headers?.location || '';
+  if (r.status === 200 || loc.indexOf('login.jsp') !== -1) {
+    throw new Error('LOGIN_INCORRECT');
+  }
+  let token = null;
+  if (r.headers) {
+    for (const [k, v] of Object.entries(r.headers)) {
+      if (k.toLowerCase().replace(/-/g, '_') === 'http_x_csrf_token') { token = v; break; }
+    }
+  }
+  if (!token) {
+    const tk = await httpGet(baseUrl + '/_csrfTokenVar.jsp');
+    if (tk.status === 200 && typeof tk.data === 'string') {
+      const m = tk.data.match(/=\s*["']([A-Za-z0-9]+)["']/);
+      if (m) token = m[1];
+    }
+  }
+  context.set('csrfToken', token);
+}
+
+async function cmdstat(xml, _retried) {
+  let url = context.get('cmdstatUrl');
+  let token = context.get('csrfToken');
+  if (!url) { await login(); url = context.get('cmdstatUrl'); token = context.get('csrfToken'); }
+  const headers = { 'Content-Type': 'text/xml' };
+  if (token) headers['X-CSRF-Token'] = token;
+  const r = await httpPost(url, xml, { headers });
+  if (r.status === 302) {
+    if (_retried) throw new Error('Session redirect loop — bad credentials?');
+    context.set('csrfToken', null);
+    await login();
+    return cmdstat(xml, true);
+  }
+  if (!r.data || r.data === '\n') throw new Error('Empty response from cmdstat');
+  let xmlText = r.data;
+  const lt = xmlText.indexOf('<');
+  if (lt > 0) xmlText = xmlText.slice(lt);
+  try {
+    return await parseXml(xmlText);
+  } catch (e) {
+    if (!context.get('parseFailDump')) {
+      context.set('parseFailDump', true);
+      node.warn('Ruckus XML parse failed: ' + String(r.data).slice(0, 200));
+    }
+    throw e;
+  }
+}
+
+async function getActiveRogues() {
+  const xml = "<ajax-request action='getstat' comp='stamgr' enable-gzip='0'>"
+    + "<rogue LEVEL='1' recognized='!true'/></ajax-request>";
+  const res = await cmdstat(xml);
+  return collectElements(res, 'rogue', []);
+}
+
+async function getRoguesPiecewise(filterAttr, updaterName) {
+  const ts = Date.now();
+  const rnd = Math.floor(9000 * Math.random()) + 1000;
+  const reqId = `${updaterName}.${ts}`;
+  const cleanupId = `${updaterName}.${ts}.${rnd}`;
+  const pageSize = 100;
+  const limit = 300;
+  const out = [];
+  let pid = 0;
+  let start = 0;
+  while (out.length < limit) {
+    pid++;
+    const remaining = Math.min(pageSize, limit - out.length);
+    const xml = `<ajax-request action='getstat' comp='stamgr' enable-gzip='0' updater='${cleanupId}'>`
+      + `<rogue sortBy='time' sortDirection='-1' LEVEL='1' ${filterAttr}/>`
+      + `<pieceStat pid='${pid}' start='${start}' number='${remaining}' requestId='${reqId}' cleanupId='${cleanupId}'/>`
+      + `</ajax-request>`;
+    const res = await cmdstat(xml);
+    const page = collectElements(res, 'rogue', []);
+    for (const r of page) { out.push(r); start++; }
+    const done = findDone(res);
+    if (done === 'true' || page.length === 0) break;
+  }
+  return out;
+}
+
+async function getBlockedRogues() {
+  return getRoguesPiecewise("blocked='true'", 'brogue');
+}
+
+async function markMalicious(bssid) {
+  const xml = `<ajax-request action='docmd' xcmd='blockrogue' check-ability='10' comp='stamgr'>`
+    + `<xcmd cmd='blockrogue' tag='rogue' rogue='${bssid}'/></ajax-request>`;
+  const res = await cmdstat(xml);
+  const xmsg = res?.['ajax-response']?.response?.xmsg;
+  if (xmsg && String(xmsg.type || '0') !== '0') {
+    throw new Error('Unleashed rejected blockrogue: ' + (xmsg.lmsg || JSON.stringify(xmsg)));
+  }
+}
+
+async function unmarkMalicious(bssid) {
+  const xml = `<ajax-request action='docmd' xcmd='unblockrogue' check-ability='10' comp='stamgr'>`
+    + `<xcmd cmd='unblockrogue' tag='rogue' rogue='${bssid}'/></ajax-request>`;
+  const res = await cmdstat(xml);
+  const xmsg = res?.['ajax-response']?.response?.xmsg;
+  if (xmsg && String(xmsg.type || '0') !== '0') {
+    throw new Error('Unleashed rejected unblockrogue: ' + (xmsg.lmsg || JSON.stringify(xmsg)));
+  }
+}
+
+// --- Home Assistant Discovery payload definitions --------------------------
+const DEVICE = {
+  identifiers: ['ruckus_wips_main'],
+  name: env.get('RUCKUS_DEVICE_NAME') || 'RUCKUS Unleashed WIPS',
+  manufacturer: 'Ruckus Networks',
+  model: env.get('RUCKUS_DEVICE_MODEL') || 'Unleashed WIPS (via Node-RED)',
+  configuration_url: `https://${HOST}/`,
+};
+
+const ORIGIN = {
+  name: 'ruckus_wips_nodered',
+  sw_version: env.get('RUCKUS_SW_VERSION') || '1.1.0',
+  support_url: env.get('RUCKUS_SUPPORT_URL') || 'https://github.com/raphael1688dev/RUCKUS-NR',
+};
+
+function discoveryMessages() {
+  const avail = { availability_topic: 'ruckus_wips/status', payload_available: 'online', payload_not_available: 'offline' };
+  
+  const makeSensor = (suffix, name, icon, stateTopic, countTemplate, attrTemplate) => ({
+    topic: `homeassistant/sensor/ruckus_wips_${suffix}/config`,
+    payload: JSON.stringify({
+      name,
+      unique_id: `ruckus_wips_${suffix}`,
+      state_topic: stateTopic,
+      value_template: countTemplate,
+      json_attributes_topic: stateTopic,
+      json_attributes_template: attrTemplate,
+      state_class: 'measurement',
+      icon,
+      device: DEVICE,
+      origin: ORIGIN,
+      ...avail,
+    }),
+    retain: true,
+    qos: 1,
+  });
+
+  const sensorConfig = (suffix, name, icon) => makeSensor(
+    suffix, name, icon, `ruckus_wips/state/${suffix}`, 
+    '{{ value_json.count }}', 
+    '{{ {"rogues": value_json.rogues, "last_updated": value_json.last_updated} | tojson }}'
+  );
+
+  const eventConfig = {
+    topic: 'homeassistant/event/ruckus_wips_new_rogue/config',
+    payload: JSON.stringify({
+      name: 'New rogue detected',
+      unique_id: 'ruckus_wips_new_rogue',
+      state_topic: 'ruckus_wips/event/new_rogue',
+      event_types: ['new_rogue'],
+      device: DEVICE,
+      origin: ORIGIN,
+      ...avail,
+    }),
+    retain: true,
+    qos: 1,
+  };
+
+  return [
+    sensorConfig('active',  'RUCKUS WIPS active rogues',  'mdi:access-point-network'),
+    sensorConfig('blocked', 'RUCKUS WIPS blocked rogues', 'mdi:access-point-off'),
+    sensorConfig('total',   'RUCKUS WIPS rogues total',   'mdi:access-point-network'),
+    eventConfig
+  ];
+}
+
+async function performPoll() {
+  const ts = Date.now();
+
+  // WIPS Polling
+  const activeRaw = await getActiveRogues();
+  const blockedRaw = await getBlockedRogues();
+
+  const rogues = {};
+  for (const r of activeRaw) {
+    const n = normalizeRogue(r);
+    if (!n.bssid) continue;
+    rogues[n.bssid] = n;
+  }
+  for (const r of blockedRaw) {
+    const n = normalizeRogue(r);
+    if (!n.bssid) continue;
+    if (!rogues[n.bssid]) rogues[n.bssid] = n;
+  }
+  const list = Object.values(rogues);
+  const activeUnblocked = list.filter(r => !r.blocked);
+  const blocked = list.filter(r => r.blocked);
+
+  // Diff to fire new-rogue events (strictly active unblocked ones)
+  let seen = context.get('seenBssids');
+  const newOnes = [];
+  if (!seen) {
+    seen = {};
+  }
+  
+  // Check for newly appeared active unblocked BSSIDs
+  for (const r of activeUnblocked) {
+    if (!seen[r.bssid]) {
+      newOnes.push(r);
+    }
+  }
+  
+  // Re-create the seen list to consist strictly of currently active unblocked BSSIDs
+  seen = {};
+  for (const r of activeUnblocked) {
+    seen[r.bssid] = true;
+  }
+  context.set('seenBssids', seen);
+
+  // First-run: publish Discovery configs + online status
+  if (!context.get('discoveryPublished')) {
+    for (const m of discoveryMessages()) node.send([m, null]);
+    node.send([{ topic: 'ruckus_wips/status', payload: 'online', retain: true, qos: 1 }, null]);
+    context.set('discoveryPublished', true);
+  }
+
+  // Publish WIPS state topics
+  const stateMsg = (suffix, count, rogues) => ({
+    topic: `ruckus_wips/state/${suffix}`,
+    payload: JSON.stringify({ count, last_updated: ts, rogues }),
+    retain: true,
+    qos: 1,
+  });
+  node.send([stateMsg('active',  activeUnblocked.length, activeUnblocked), null]);
+  node.send([stateMsg('blocked', blocked.length,         blocked),         null]);
+  node.send([stateMsg('total',   list.length,            list),            null]);
+
+  // Fire new-rogue events
+  for (const r of newOnes) {
+    const payload = { event_type: 'new_rogue', ...r };
+    node.send([{ topic: 'ruckus_wips/event/new_rogue', payload: JSON.stringify(payload), retain: false, qos: 1 }, null]);
+  }
+
+  node.status({
+    fill: 'green',
+    shape: 'dot',
+    text: `${activeUnblocked.length} active / ${blocked.length} blocked @ ${new Date(ts).toLocaleTimeString()}`
+  });
+}
+
+// --- main: handle inbound message ----------------------------------------
+const topic = (msg && msg.topic) || '';
+
+// 1. Unified Command Processor (WIPS Only)
+if (topic.startsWith('ruckus_wips/cmd/') || topic.startsWith('ruckus/cmd/')) {
+  let action = '';
+  let commandPath = '';
+  if (topic.startsWith('ruckus_wips/cmd/')) {
+    commandPath = 'ruckus_wips/cmd/';
+    action = topic.substring('ruckus_wips/cmd/'.length);
+  } else {
+    commandPath = 'ruckus/cmd/';
+    action = topic.substring('ruckus/cmd/'.length);
+  }
+
+  // Prevents infinite JSON stringify loops when the node subscribes to its own ACK topic.
+  if (action === 'ack') {
+    return null;
+  }
+
+  const payloadRaw = (msg.payload === undefined || msg.payload === null) ? '' : msg.payload;
+  const ackTopic = `${commandPath}ack`;
+  const ackBase = { payload: payloadRaw, action, ts: Date.now() };
+
+  try {
+    if (action === 'mark_malicious') {
+      const bssid = String(payloadRaw).trim().toLowerCase().replace(/-/g, ':');
+      if (!/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/.test(bssid)) throw new Error('invalid BSSID');
+      await markMalicious(bssid);
+    } 
+    else if (action === 'unmark_malicious') {
+      if (!ENABLE_UNBLOCK) throw new Error('unmark disabled (set RUCKUS_ENABLE_UNBLOCK=true)');
+      const bssid = String(payloadRaw).trim().toLowerCase().replace(/-/g, ':');
+      if (!/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/.test(bssid)) throw new Error('invalid BSSID');
+      await unmarkMalicious(bssid);
+    } 
+    else {
+      throw new Error('unknown WIPS action: ' + action);
+    }
+
+    node.send([null, { topic: ackTopic, payload: JSON.stringify({ ...ackBase, ok: true }), retain: false, qos: 1 }]);
+    await performPoll();
+  } catch (err) {
+    node.send([null, { topic: ackTopic, payload: JSON.stringify({ ...ackBase, ok: false, message: err.message || String(err) }), retain: false, qos: 1 }]);
+    node.error('WIPS Command ' + action + ' failed: ' + (err.message || err), msg);
+  }
+  return null;
+}
+
+// 1b. Home Assistant Birth Message (Re-publish discovery on HA online status)
+if (topic === 'homeassistant/status') {
+  if (String(msg.payload) === 'online') {
+    context.set('discoveryPublished', false);
+    try {
+      await performPoll();
+    } catch (err) {
+      node.error('Failed to republish discovery on HA birth message: ' + (err.message || err));
+    }
+  }
+  return null;
+}
+
+// 2. Poll Router (WIPS Only)
+try {
+  await performPoll();
+} catch (err) {
+  node.status({ fill: 'red', shape: 'ring', text: 'WIPS poll failed: ' + (err.message || err).toString().slice(0, 60) });
+  node.error('WIPS Poll failed: ' + (err.stack || err.message || err), msg);
+}
+return null;
+
+--- finalize ---
+
+

@@ -1,0 +1,42 @@
+name: Validate flow JSON
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  flow-json:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check flows/*.json parses
+        run: |
+          for f in flows/*.json; do
+            echo "Parsing $f"
+            python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f"
+          done
+      - name: Lint Node-RED function-node JavaScript
+        run: |
+          # Extract function-node bodies and run them through node --check
+          python3 - <<'PY'
+          import json, subprocess, sys, tempfile, pathlib
+          ok = True
+          for flow in pathlib.Path("flows").glob("*.json"):
+              nodes = json.load(open(flow))
+              for n in nodes:
+                  if n.get("type") != "function":
+                      continue
+                  for key in ("func", "initialize", "finalize"):
+                      src = n.get(key) or ""
+                      if not src.strip():
+                          continue
+                      # Wrap in an async IIFE so top-level await is valid
+                      wrapped = f"(async function(){{\n{src}\n}})();"
+                      with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as t:
+                          t.write(wrapped); path = t.name
+                      r = subprocess.run(["node", "--check", path], capture_output=True, text=True)
+                      if r.returncode != 0:
+                          print(f"::error file={flow},title=function-node {key} in {n.get('name', n['id'])}::{r.stderr.strip()}")
+                          ok = False
+          sys.exit(0 if ok else 1)
+          PY
