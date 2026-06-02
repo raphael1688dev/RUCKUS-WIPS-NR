@@ -1,6 +1,22 @@
 # Technical Debt Audit - RUCKUS Unleashed WIPS Node-RED Bridge
 
-This document provides a comprehensive technical debt audit of the JavaScript native `aioruckus` port running inside the Node-RED flow. It highlights architectural bottlenecks, transport vulnerabilities, HA lifecycle sync failures, and actionable refactoring pathways.
+This document provides a comprehensive technical debt audit of the JavaScript native `aioruckus` port running inside the Node-RED flow. It tracks architectural bottlenecks, transport vulnerabilities, HA lifecycle sync status, and refactoring pathways.
+
+---
+
+## Status Dashboard
+
+| Category | Debt / Risk | Status | Resolution / Details |
+| :--- | :--- | :--- | :--- |
+| **1. Transport** | 1.1 SSL/TLS Bypass | ⚠️ REMAINING | Vulnerable to LAN MitM attacks; needs `RUCKUS_CA_CERT` |
+| **1. Transport** | 1.2 Gzip Vulnerability | ⚠️ REMAINING | No gzip parser support; crashes if Ruckus forces gzip |
+| **1. Transport** | 1.3 EOF-Framing Assumption | ⚠️ REMAINING | Relies on socket close; could hang on persistent Keep-Alive |
+| **2. Resiliency**| 2.1 Admin Account Lockout | ⚠️ REMAINING | Brute-force loop risks locking controller on password changes |
+| **2. Resiliency**| 2.2 Soft Failures (LWT Flaw) | ⚠️ REMAINING | HA entities stay "online" if AP controller goes offline |
+| **3. Architecture**| 3.1 Sandboxed Code Monolith | ✅ **RESOLVED** | Decomposed into modular ES Modules under `src/` & built via `build.js` |
+| **3. Architecture**| 3.2 Hardcoded Discovery Metadata| ✅ **RESOLVED** | Extracted device metadata and MQTT topic prefixes into `env.get()` |
+| **4. Lifecycle** | 4.1 HA Birth & Reconnect Sync | ✅ **RESOLVED** | Implemented `homeassistant/status` birth & `status_monitor` reconnect sync |
+| **5. Testing**     | 5.1 Manual Verification Dependency| ✅ **RESOLVED** | Added automated mock unit tests (`driver.test.mjs`) & `live_test.mjs` |
 
 ---
 
@@ -47,40 +63,32 @@ This document provides a comprehensive technical debt audit of the JavaScript na
 
 ---
 
-## 🏛️ 3. Flow Architecture & Maintainability Debt (Medium Priority)
+## 🏛️ 3. Flow Architecture & Maintainability Debt (Resolved)
 
 ### 3.1 Sandboxed Code Monolith
-* **The Debt**: All WIPS driver functions (networking, XML parsing, cookie jar, pagination, diff logic, discovery payload construction, and command routing) are housed in a single 500+ line JavaScript block inside Node-RED's Function Node.
-* **Impact**:
-  - Precludes standard unit testing and is highly unergonomic to maintain or edit in Node-RED's small text UI window.
-* **Remediation**:
-  - Decompose the monolith into linked subflow nodes (e.g., separate Auth, Query, Diff, and Command nodes) or maintain the source files separately under a `src/` directory and use a build script to generate the final flow JSON.
+* **Resolution**: 
+  - Decomposed all logic from [func.js](file:///Users/raphael/Desktop/RUCKUS-NR-REVIEW-AG/func.js) into 7 separate, clean, and testable ES Modules under the new `src/` directory.
+  - Implemented [build.js](file:///Users/raphael/Desktop/RUCKUS-NR-REVIEW-AG/build.js) to automate concatenation, ESM syntax-stripping, syntax check, and injection directly into `flows/ruckus_wips.json`.
 
 ### 3.2 Hardcoded Discovery Metadata
-* **The Debt**: Discovery configuration metadata (such as device names, origin links, and software version strings) are hardcoded inside the `discoveryMessages()` helper function in `func.js`.
-* **Impact**:
-  - Hard to share or customize without editing deep lines of JavaScript code.
-* **Remediation**:
-  - Extract these properties into Node-RED environment variables (e.g., `env.get('RUCKUS_DEVICE_NAME')`), keeping `func.js` entirely generic.
+* **Resolution**: 
+  - Extracted RUCKUS device configuration names, identifiers, software version strings, support urls, and the MQTT base topic prefix into Node-RED configuration environment variables (`env.get()`) loaded dynamically inside `src/config.mjs`.
 
 ---
 
-## 📡 4. HA & MQTT Lifecycle Sync Debt (Medium-Low Priority)
+## 📡 4. HA & MQTT Lifecycle Sync Debt (Resolved)
 
 ### 4.1 Lack of Home Assistant Birth Message Tracking
-* **The Debt**: The discovery payloads and `online` birth messages are published exactly once on Node-RED startup (`context.get('discoveryPublished')`).
-* **Impact**:
-  - If the MQTT broker restarts and loses its retained message cache, or if Home Assistant is reinstalled/cleared, the entities will disappear from Home Assistant and will not return until Node-RED itself is restarted or redeployed.
-* **Remediation**:
-  - Add an `mqtt in` node subscribed to `homeassistant/status` (the topic HA publishes `online` to when it finishes starting up). When a birth message is received, reset the `discoveryPublished` flag to force-republish all discovery configurations.
+* **Resolution**: 
+  - Added an MQTT input node listening to `homeassistant/status` to republish Discovery configurations whenever Home Assistant starts up.
+  - Added a Node-RED `status` monitor node wired directly to the MQTT publisher node. On successful connection/reconnection to the broker, it triggers a republish of the Discovery configuration to ensure registry sync even after MQTT broker crashes.
 
 ---
 
-## 🧪 5. Testing & Validation Debt (Low Priority)
+## 🧪 5. Testing & Validation Debt (Resolved)
 
 ### 5.1 Manual Verification Dependency
-* **The Debt**: There is no mock environment or automated unit test suite for the JavaScript driver.
-* **Impact**:
-  - Verifying a change requires importing the flow JSON onto the live Node-RED host and physically interacting with the HA environment or triggering simulated MQTT packets, making regression testing slow and error-prone.
-* **Remediation**:
-  - Create a test script in the repo that mocks Node-RED's global sandbox objects (`node`, `context`, `env`) and runs unit tests using a test framework (e.g., `mocha` or `jest`) against `func.js` or `extracted_logic.js`.
+* **Resolution**: 
+  - Created a local, automated unit test suite [tests/driver.test.mjs](file:///Users/raphael/Desktop/RUCKUS-NR-REVIEW-AG/tests/driver.test.mjs) utilizing Node.js's built-in test runner (`node --test`).
+  - Added [tests/live_test.mjs](file:///Users/raphael/Desktop/RUCKUS-NR-REVIEW-AG/tests/live_test.mjs) as a real-device connectivity verification test tool.
+  - Consolidated validation inside [test_syntax.sh](file:///Users/raphael/Desktop/RUCKUS-NR-REVIEW-AG/test_syntax.sh).
