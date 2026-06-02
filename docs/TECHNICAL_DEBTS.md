@@ -8,11 +8,11 @@ This document provides a comprehensive technical debt audit of the JavaScript na
 
 | Category | Debt / Risk | Status | Resolution / Details |
 | :--- | :--- | :--- | :--- |
-| **1. Transport** | 1.1 SSL/TLS Bypass | ⚠️ REMAINING | Vulnerable to LAN MitM attacks; needs `RUCKUS_CA_CERT` |
-| **1. Transport** | 1.2 Gzip Vulnerability | ⚠️ REMAINING | No gzip parser support; crashes if Ruckus forces gzip |
-| **1. Transport** | 1.3 EOF-Framing Assumption | ⚠️ REMAINING | Relies on socket close; could hang on persistent Keep-Alive |
-| **2. Resiliency**| 2.1 Admin Account Lockout | ⚠️ REMAINING | Brute-force loop risks locking controller on password changes |
-| **2. Resiliency**| 2.2 Soft Failures (LWT Flaw) | ⚠️ REMAINING | HA entities stay "online" if AP controller goes offline |
+| **1. Transport** | 1.1 SSL/TLS Bypass | ✅ **RESOLVED** | Secure connection verification via custom `RUCKUS_CA_CERT` |
+| **1. Transport** | 1.2 Gzip Vulnerability | ✅ **RESOLVED** | Added automatic gzip and deflate content decoding support via `zlib` |
+| **1. Transport** | 1.3 EOF-Framing Assumption | ✅ **RESOLVED** | Parses `Content-Length` header for early stream resolution |
+| **2. Resiliency**| 2.1 Admin Account Lockout | ✅ **RESOLVED** | Locks login attempts for 10 min after failure; resets on config change |
+| **2. Resiliency**| 2.2 Soft Failures (LWT Flaw) | ✅ **RESOLVED** | Publishes offline status to MQTT topic after 3 consecutive failures |
 | **3. Architecture**| 3.1 Sandboxed Code Monolith | ✅ **RESOLVED** | Decomposed into modular ES Modules under `src/` & built via `build.js` |
 | **3. Architecture**| 3.2 Hardcoded Discovery Metadata| ✅ **RESOLVED** | Extracted device metadata and MQTT topic prefixes into `env.get()` |
 | **4. Lifecycle** | 4.1 HA Birth & Reconnect Sync | ✅ **RESOLVED** | Implemented `homeassistant/status` birth & `status_monitor` reconnect sync |
