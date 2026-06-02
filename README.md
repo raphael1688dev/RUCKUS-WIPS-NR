@@ -213,34 +213,25 @@ page) → **Add Script** → **Start with an empty script** → ⋮ → **Edit i
 YAML**, then paste:
 
 ```yaml
-alias: Ruckus Block Typed BSSID
-description: Publish BSSID to ruckus_wips/cmd/mark_malicious
-mode: single
+alias: RUCKUS WIPS Manual Block
 sequence:
-  - variables:
-      bssid: "{{ states('input_text.ruckus_block_bssid') | lower | trim }}"
-  - condition: template
-    value_template: "{{ bssid | regex_match('^([0-9a-f]{2}:){5}[0-9a-f]{2}$') }}"
   - action: mqtt.publish
     data:
       topic: ruckus_wips/cmd/mark_malicious
-      payload: "{{ bssid }}"
+      payload: "{{ states('input_text.ruckus_block_bssid') | trim | lower }}"
       qos: 1
       retain: false
-  - action: input_text.set_value
-    target:
-      entity_id: input_text.ruckus_block_bssid
-    data:
-      value: ""
+mode: single
+description: ""
 ```
 
 > ⚠️ **Keep `alias:` in ASCII English.** HA derives the script's service
 > name (used by dashboard `tap_action`) from the alias at creation time by
 > stripping non-ASCII characters. Once registered, the service name is
 > sticky — even a full HA restart will not update it. With this alias
-> both entity_id and service become `script.ruckus_block_typed_bssid`.
+> both entity_id and service become `script.ruckus_wips_manual_block`.
 > Rename the **display Name** to whatever you like afterwards (e.g.
-> `Ruckus 封鎖貼上的 BSSID`).
+> `RUCKUS WIPS Manual Block`).
 
 ### 3. Dashboard card
 
@@ -248,32 +239,35 @@ sequence:
 type: vertical-stack
 cards:
   - type: markdown
-    content: |
-      ## 目前未封鎖的 Rogue AP
-      {% set rogues = state_attr('sensor.ruckus_wips_active_rogues', 'rogues') or [] %}
-      {% if rogues %}
-      {% for r in rogues %}
-      - **{{ r.ssid or '(隱藏 SSID)' }}** `{{ r.bssid }}`
-        — ch{{ r.channel }} / rssi {{ r.rssi }} / 偵測者 {{ r.detection_ap }} ({{ r.detection_ap_location }})
-      {% endfor %}
-      {% else %}
-      ✓ 目前沒有未處理的 rogue AP
-      {% endif %}
+    content: >
+      {% set rogues = state_attr('sensor.ruckus_unleashed_wips_ruckus_wips_active_rogues', 'rogues') or [] %}
 
+      {% if rogues %}
+
+      {% for r in rogues %} - **{{ r.ssid or '(Hidden SSID)' }}** `{{ r.bssid }}`
+        — Ch{{ r.channel }} / {{ r.rssi }} dBm / Detected by {{ r.detection_ap }} ({{ r.detection_ap_location }})
+      {% endfor %}
+
+      {% else %}
+
+       No active unblocked rogue APs detected. WIPS is secured.
+
+      {% endif %}
+    title: Active Unblocked Rogue APs via MQTT
   - type: entities
-    title: 執行封鎖
+    title: Manual Rogue AP Block via MQTT
     show_header_toggle: false
     entities:
       - entity: input_text.ruckus_block_bssid
-        name: 貼上 BSSID
+        name: Paste BSSID
         icon: mdi:identifier
       - type: button
-        name: 對上方 BSSID 執行封鎖
+        name: Perform WIPS Block on BSSID
         icon: mdi:wifi-cancel
-        action_name: 封鎖
+        action_name: Block
         tap_action:
           action: perform-action
-          perform_action: script.ruckus_block_typed_bssid
+          perform_action: script.ruckus_wips_manual_block
 ```
 
 ### Optional: unblock card
@@ -281,6 +275,7 @@ cards:
 Mirror the pattern with a second helper + script publishing to
 `ruckus_wips/cmd/unmark_malicious`. Make sure
 `RUCKUS_ENABLE_UNBLOCK=true` in the Node-RED add-on env.
+
 
 ## Automation examples
 
